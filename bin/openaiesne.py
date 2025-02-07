@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-   This file belong to https://github.com/snolfi/evorobotpy
-   and has been written by Stefano Nolfi and Paolo Pagliuca, stefano.nolfi@istc.cnr.it, paolo.pagliuca@istc.cnr.it
+   This file belong to https://github.com/Brenda-Machado/evorobotpy2
+   and has been written by Stefano Nolfi and Paolo Pagliuca, stefano.nolfi@istc.cnr.it, paolo.pagliuca@istc.cnr.it,
+   Arthur H. Bianchini, arthur.h.bianchini@grad.ufsc.br and Brenda S. Machado, brenda.silva.machado@grad.ufsc.br
    salimans.py include an implementation of the OpenAI-ES algorithm described in
    Salimans T., Ho J., Chen X., Sidor S & Sutskever I. (2017). Evolution strategies as a scalable alternative to reinforcement learning. arXiv:1703.03864v2
-   requires es.py, policy.py, and evoalgo.py 
+   requires es.py, policy.py, and evoalgo.py; and modified to work with niches and environmental differentiation
 """
 
 import numpy as np
@@ -18,10 +19,12 @@ from utils import ascendent_sort
 import sys
 import os
 import configparser
+import random
 
 # Parallel implementation of Open-AI-ES algorithm developed by Salimans et al. (2017)
 # the workers evaluate a fraction of the population in parallel
 # the master post-evaluate the best sample of the last generation and eventually update the input normalization vector
+# niches and environmental differentiation are supported
 
 
 class Algo(EvoAlgo):
@@ -41,6 +44,7 @@ class Algo(EvoAlgo):
             self.wdecay = 0
             self.symseed = 1
             self.saveeach = 60
+            self.number_niches = 10
             options = config.options("ALGO")
             for o in options:
                 found = 0
@@ -65,6 +69,11 @@ class Algo(EvoAlgo):
                 if o == "saveeach":
                     self.saveeach = config.getint("ALGO", "saveeach")
                     found = 1
+                if o == "number_niches":
+                    self.number_niches = config.getint("ALGO", "number_niches")
+                    found = 1
+                if o == "number_gens":
+                    self.nGens = config.getint("ALGO", "number_gens")
 
                 if found == 0:
                     print(
@@ -89,6 +98,12 @@ class Algo(EvoAlgo):
                     print(
                         "saveeach [integer]        : save file every N minutes (default 60)"
                     )
+                    print(
+                        "number_niches [integer]   : number of niches to be used (default 9)"
+                    )
+                    print(
+                        "number_gens [integer]     : number of generations until migration occurs (default 34)"
+                    )
 
                     sys.exit()
         else:
@@ -99,9 +114,14 @@ class Algo(EvoAlgo):
 
     def setProcess(self):
         self.loadhyperparameters()  # load hyperparameters
-        self.center = np.copy(self.policy.get_trainable_flat())  # the initial centroid
-        self.nparams = len(self.center)  # number of adaptive parameters
-        self.cgen = 0  # currrent generation
+        self.avecenter = None
+        self.bniche = None    
+        self.colonizer = [np.nan for _ in range(self.number_niches)]
+        self.fitness = np.zeros(self.number_niches)
+        self.avecenters = np.zeros(self.number_niches)
+        self.centers = [np.copy(self.policy.get_trainable_flat()) for i in range(self.number_niches)]  # the initial centroids
+        self.nparams = len(self.centers[0])  # number of adaptive parameters
+        self.cgen = 1  # currrent generation
         self.samplefitness = zeros(self.batchSize * 2)  # the fitness of the samples
         self.samples = None  # the random samples
         self.m = zeros(self.nparams)  # Adam: momentum vector
@@ -116,7 +136,7 @@ class Algo(EvoAlgo):
         )
         self.rs = None  # random number generator
         self.inormepisodes = (
-            self.batchSize * 2 * self.policy.ntrials / 100.0
+            self.number_niches * self.batchSize * 2 * self.policy.ntrials / 100.0
         )  # number of normalization episode for generation (1% of generation episodes)
         self.tnormepisodes = (
             0.0  # total epsidoes in which normalization data should be collected so far
@@ -127,11 +147,11 @@ class Algo(EvoAlgo):
         )
 
     def savedata(self):
-        self.save()  # save the best agent so far, the best postevaluated agent so far, and progress data across generations
+        self.save(esne=True)  # save the best agent so far, the best postevaluated agent so far, and progress data across generations
         fname = self.filedir + "/S" + str(self.seed) + ".fit"
         fp = open(fname, "w")  # save summary
         fp.write(
-            "Seed %d (%.1f%%) gen %d msteps %d bestfit %.2f bestgfit %.2f bestsam %.2f avgfit %.2f paramsize %.2f \n"
+            "Seed %d (%.1f%%) gen %d msteps %d bestfit %.2f bestgfit %.2f bestniche %d avgfit %.2f paramsize %.2f \n"
             % (
                 self.seed,
                 self.steps / float(self.maxsteps) * 100,
@@ -139,51 +159,57 @@ class Algo(EvoAlgo):
                 self.steps / 1000000,
                 self.bestfit,
                 self.bestgfit,
-                self.bfit,
+                self.bniche,
                 self.avgfit,
                 self.avecenter,
             )
         )
         fp.close()
 
-    def evaluate(self):
+    def evaluate(self, niche, oniche=None):
+        oniche_flag = 1
+         
+        if oniche is None:
+            oniche = niche
+            oniche_flag = 0
+        
         cseed = (
             self.seed + self.cgen * self.batchSize
         )  # Set the seed for current generation (master and workers have the same seed)
         self.rs = np.random.RandomState(cseed)
         self.samples = self.rs.randn(self.batchSize, self.nparams)
-        self.cgen += 1
 
         # evaluate samples
         candidate = np.arange(self.nparams, dtype=np.float64)
         for b in range(self.batchSize):
             for bb in range(2):
                 if bb == 0:
-                    candidate = self.center + self.samples[b, :] * self.noiseStdDev
+                    candidate = self.centers[niche] + self.samples[b, :] * self.noiseStdDev
                 else:
-                    candidate = self.center - self.samples[b, :] * self.noiseStdDev
+                    candidate = self.centers[niche] - self.samples[b, :] * self.noiseStdDev
                 self.policy.set_trainable_flat(candidate)
                 self.policy.nn.normphase(
                     0
                 )  # normalization data is collected during the post-evaluation of the best sample of he previous generation
                 eval_rews, eval_length = self.policy.rollout(
                     self.policy.ntrials,
-                    seed=(self.seed + (self.cgen * self.batchSize) + b),
+                    seed=self.niches[oniche],
                 )
                 self.samplefitness[b * 2 + bb] = eval_rews
                 self.steps += eval_length
 
         fitness, self.index = ascendent_sort(self.samplefitness)  # sort the fitness
         self.avgfit = np.average(fitness)  # compute the average fitness
+        
 
         self.bfit = fitness[(self.batchSize * 2) - 1]
         bidx = self.index[(self.batchSize * 2) - 1]
         if (bidx % 2) == 0:  # regenerate the genotype of the best samples
             bestid = int(bidx / 2)
-            self.bestsol = self.center + self.samples[bestid] * self.noiseStdDev
+            self.bestsol = self.centers[niche] + self.samples[bestid] * self.noiseStdDev
         else:
             bestid = int(bidx / 2)
-            self.bestsol = self.center - self.samples[bestid] * self.noiseStdDev
+            self.bestsol = self.centers[niche] - self.samples[bestid] * self.noiseStdDev
 
         self.updateBest(
             self.bfit, self.bestsol
@@ -212,9 +238,11 @@ class Algo(EvoAlgo):
                 self.steps += eval_length
             gfit /= self.policy.nttrials
             self.updateBestg(gfit, self.bestsol)
+            if gfit > self.fitness[oniche] and not oniche_flag:
+                self.fitness[oniche] = gfit
+        return gfit
 
-    def optimize(self):
-
+    def optimize(self, niche):
         popsize = self.batchSize * 2  # compute a vector of utilities [-0.5,0.5]
         utilities = zeros(popsize)
         for i in range(popsize):
@@ -248,7 +276,7 @@ class Algo(EvoAlgo):
         g /= popsize  # normalize the gradient for the popsize
 
         if self.wdecay == 1:
-            globalg = -g + 0.005 * self.center  # apply weight decay
+            globalg = -g + 0.005 * self.centers[niche]  # apply weight decay
         else:
             globalg = -g
 
@@ -262,10 +290,72 @@ class Algo(EvoAlgo):
         self.v = self.beta2 * self.v + (1.0 - self.beta2) * (globalg * globalg)
         dCenter = -a * self.m / (sqrt(self.v) + self.epsilon)
 
-        self.center += (
+        self.centers[niche] += (
             dCenter  # move the center in the direction of the momentum vectors
         )
-        self.avecenter = np.average(np.absolute(self.center))
+        self.avecenters[niche] = np.average(np.absolute(self.centers[niche]))
+        
+    def storePerformance(self):
+        self.stat = np.append(
+                self.stat,
+                [
+                    self.steps,
+                    self.bestfit,
+                    self.bestgfit,
+                    self.bniche,
+                    self.avgfit,
+                    self.avecenter,
+                ],
+            )  # store performance across generations
+
+    def intraniche(self):
+
+        for niche in range(self.number_niches):
+            self.evaluate(niche)   # evaluate samples
+            self.optimize(niche)   # estimate the gradient and move the centroid in the gradient direction
+        print(
+                "Seed %d (%.1f%%) gen %d msteps %d bestfit %.2f bestgfit %.2f"
+                % (
+                    self.seed,
+                    self.steps / float(self.maxsteps) * 100,
+                    self.cgen,
+                    self.steps / 1000000,
+                    self.bestfit,
+                    self.bestgfit,
+                )
+            )
+        self.cgen += 1
+        self.storePerformance()
+
+    def interniche(self): 
+        self.colonized = [False for _ in range(self.number_niches**2)]
+        fitMatrix = np.zeros(shape=(self.number_niches, self.number_niches))
+
+        for niche in range(self.number_niches):
+            for miche in range(self.number_niches):
+                if miche != niche:
+                    # Evaluate center of niche n in niche m
+                    fitMatrix[niche][miche] = self.evaluate(niche, miche)
+                else:
+                    fitMatrix[niche][miche] = -99999999
+
+        for miche in range(self.number_niches):
+            # biche = best niche in miche
+            biche = np.argmax([fitMatrix[j][miche] for j in range(self.number_niches)])
+            maxFit = fitMatrix[biche][miche]
+
+            
+            if maxFit > self.fitness[miche]:
+                print("Niche", biche+1, "colonized niche", miche+1)
+                self.colonized[miche] = biche
+
+                for i in range(self.number_niches):
+                    fitMatrix[biche][i] = -99999999
+
+                # Replace i with o in niche m
+                self.fitness[miche] = maxFit
+                # Replace center of niche m with center of niche j
+                self.centers[miche] = self.centers[biche]
 
     def run(self):
 
@@ -288,23 +378,39 @@ class Algo(EvoAlgo):
             )
         )
 
+        random_niches = []
+        num_random_niches = self.number_niches*100
+
+        for _ in range(num_random_niches):
+            random_niches.append([random.randint(1, num_random_niches*10) for _ in range(self.policy.ntrials)])
+
+        self.niches = [0 for _ in range(self.number_niches)]
+ 
+        for niche in range(self.number_niches): 
+            self.niches[niche] = random_niches[niche]
+
+        remove_first_gen = 1
+
         while self.steps < self.maxsteps:
 
-            self.evaluate()  # evaluate samples
+            for _ in range(self.nGens):
+                self.intraniche()
+                
+            if remove_first_gen:
+                self.cgen -= 1
+                remove_first_gen = 0
+            
+            self.bniche = np.argmax(self.fitness)
+            
+            print("Intraniche finished")
+            
+            self.interniche()
 
-            self.optimize()  # estimate the gradient and move the centroid in the gradient direction
+            print("Interniche finished")
 
-            self.stat = np.append(
-                self.stat,
-                [
-                    self.steps,
-                    self.bestfit,
-                    self.bestgfit,
-                    self.bfit,
-                    self.avgfit,
-                    self.avecenter,
-                ],
-            )  # store performance across generations
+            self.avgfit = np.average(self.fitness)
+            
+            self.avecenter = np.average(self.avecenters)   
 
             if (time.time() - last_save_time) > (self.saveeach * 60):
                 self.savedata()  # save data on files
@@ -315,7 +421,7 @@ class Algo(EvoAlgo):
                 self.normalizationdatacollected = False
 
             print(
-                "Seed %d (%.1f%%) gen %d msteps %d bestfit %.2f bestgfit %.2f bestsam %.2f avg %.2f weightsize %.2f"
+                "Seed %d (%.1f%%) gen %d msteps %d bestfit %.2f bestgfit %.2f bestniche %d avg %.2f weightsize %.2f"
                 % (
                     self.seed,
                     self.steps / float(self.maxsteps) * 100,
@@ -323,13 +429,13 @@ class Algo(EvoAlgo):
                     self.steps / 1000000,
                     self.bestfit,
                     self.bestgfit,
-                    self.bfit,
+                    self.bniche,
                     self.avgfit,
                     self.avecenter,
                 )
             )
 
-        self.savedata()  # save data at the end of evolution
+        self.savedata()
 
         # print simulation time
         end_time = time.time()
